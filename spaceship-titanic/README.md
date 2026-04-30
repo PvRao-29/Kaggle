@@ -3,9 +3,9 @@
 This repository trains a tabular ML model for the [Spaceship Titanic](https://www.kaggle.com/competitions/spaceship-titanic) competition and generates a Kaggle-ready `submission.csv`.
 
 The pipeline uses:
-- Feature engineering from passenger/cabin IDs and onboard spending
-- Mixed preprocessing for categorical and numeric features
-- `HistGradientBoostingClassifier` from scikit-learn
+- Feature engineering from passenger/cabin IDs, family/group structure, and onboard spending
+- Group-aware imputations and interaction features
+- `CatBoostClassifier` with repeated stratified cross-validation
 
 ## Model Approach
 
@@ -14,44 +14,62 @@ The pipeline uses:
 1. **Load data**
    - Reads `data/train.csv` and `data/test.csv`.
 
-2. **Feature engineering (`add_features`)**
+2. **Build dataset-level statistics (`build_stats`)**
+   - Computes pooled train+test lookup stats used for feature construction and imputations:
+     - `group_sizes`
+     - `family_sizes` (surname counts)
+     - `cabin_counts`
+     - group-level `HomePlanet` / `Destination` mode
+     - group-level median age
+
+3. **Feature engineering (`add_features`)**
    - Splits `Cabin` into:
      - `CabinDeck`
      - `CabinNum` (numeric)
      - `CabinSide`
-   - Creates spending features:
+   - Adds group/family features:
+     - `GroupId`, `InGroupIndex`, `GroupSize`
+     - `Surname`, `FamilySize`
+     - `CabinOccupancy`
+   - Fills key missing values using group-level signals then global defaults:
+     - `HomePlanet`, `Destination`, `Age`
+   - Creates spending and behavior features:
      - `TotalSpend` = sum of `RoomService`, `FoodCourt`, `ShoppingMall`, `Spa`, `VRDeck`
-     - `AnySpend` = whether `TotalSpend > 0`
-   - Extracts group info from `PassengerId`:
-     - `InGroupIndex` from the suffix after `_`
-     - `GroupSize` computed across both train and test passenger groups
+     - `AnySpend`, `LuxurySpend`, `EssentialSpend`
+     - `SpendPerGroupMember`, `LuxuryToEssential`
+     - `AwakeAdultZeroSpend`, `CryoSleepInferredFromSpend`
+   - Adds cabin/age interactions:
+     - `DeckSide`, `DeckAnySpend`, `CabinRegion`, `CabinKnown`
+     - `IsAlone`, `IsChild`, `GroupAvgAge`
+     - missingness indicators (`AgeMissing`, `VIPMissing`)
 
-3. **Prepare target and columns**
+4. **Prepare target and columns (`prepare`)**
    - Target: `Transported` converted to boolean
-   - Drops leakage/identifier-style columns from training features:
-     - `PassengerId`, `Cabin`, `Name`
+   - Drops identifier-style columns:
+     - `PassengerId`, `Cabin`, `Name`, `GroupId`
+   - Converts boolean-like columns for CatBoost compatibility:
+     - `CryoSleep`, `VIP` -> `1.0` / `0.0`
+   - Keeps string/object columns as categorical features for CatBoost
 
-4. **Preprocessing**
-   - Categorical columns (`object`, `string`, `bool`):
-     - `SimpleImputer(strategy="most_frequent")`
-     - `OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)`
-   - Numeric columns:
-     - `SimpleImputer(strategy="median")`
+5. **Model (`model`)**
+   - `CatBoostClassifier` with:
+     - `depth=6`
+     - `learning_rate=0.05`
+     - `l2_leaf_reg=3`
+     - `iterations=3000` (used during CV with early stopping)
+     - `loss_function="Logloss"`
+     - `eval_metric="Accuracy"`
+     - `auto_class_weights="Balanced"`
 
-5. **Model**
-   - `HistGradientBoostingClassifier` with:
-     - `max_depth=8`
-     - `learning_rate=0.06`
-     - `max_iter=350`
-     - `min_samples_leaf=20`
-     - `random_state=42`
+6. **Validation (`cross_validate`)**
+   - Repeated stratified K-fold:
+     - Seeds: `13`, `29`, `42`
+     - Folds per seed: `5` (`3 x 5 = 15` validation runs total)
+   - Uses early stopping (`early_stopping_rounds=200`)
+   - Collects best iteration per fold and uses median best iteration for final training
 
-6. **Validation + final training**
-   - Stratified train/validation split
-   - Prints holdout accuracy
-   - Retrains on full training data
-
-7. **Submission output**
+7. **Final training + submission output**
+   - Trains final model on full training set with selected iteration count
    - Writes `outputs/submission.csv` with:
      - `PassengerId`
      - predicted `Transported` (bool)
@@ -63,12 +81,4 @@ The pipeline uses:
   - `numpy`
   - `pandas`
   - `scikit-learn`
-
-
-## Notes for Improvement
-
-Potential next upgrades:
-- Cross-validation instead of a single holdout split
-- Better categorical handling (target encoding or CatBoost-style models)
-- Additional domain features (family/group consistency, cabin interactions)
-- Hyperparameter tuning (Optuna/grid search)
+  - `catboost`
