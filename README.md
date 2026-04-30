@@ -1,1 +1,1 @@
-A collection of Kaggle Competitions I have participated in
+A centralized collection of my work on Kaggle competitions ... covering problem understanding, modeling, and iterative experimentation across a range of datasets and domains.
