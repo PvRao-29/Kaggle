@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .DS_Store
+catboost_info/
 
 # Virtual environments
 .venv

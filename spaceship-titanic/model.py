@@ -1,20 +1,27 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.impute import SimpleImputer
+from catboost import CatBoostClassifier
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import OrdinalEncoder
+from sklearn.model_selection import StratifiedKFold
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "outputs"
 
+SEED = 42
 SPEND_COLS = ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]
+CV_FOLDS = 5
+EARLY_STOPPING_ROUNDS = 200
 
+CATBOOST_CONFIGS = [
+    {"depth": 6, "learning_rate": 0.03, "l2_leaf_reg": 5, "iterations": 4000},
+    {"depth": 8, "learning_rate": 0.03, "l2_leaf_reg": 5, "iterations": 4000},
+    {"depth": 8, "learning_rate": 0.02, "l2_leaf_reg": 8, "iterations": 5000},
+    {"depth": 10, "learning_rate": 0.02, "l2_leaf_reg": 8, "iterations": 5000},
+    {"depth": 8, "learning_rate": 0.05, "l2_leaf_reg": 3, "iterations": 3000},
+]
 
 def add_features(df, group_sizes):
     df = df.copy()
@@ -22,16 +29,100 @@ def add_features(df, group_sizes):
     df[["CabinDeck", "CabinNum", "CabinSide"]] = df["Cabin"].str.split("/", expand=True)
     df["CabinNum"] = pd.to_numeric(df["CabinNum"], errors="coerce")
 
+    groups = df["PassengerId"].str.split("_")
+    group_id = groups.str[0]
+
+    df["InGroupIndex"] = pd.to_numeric(groups.str[1], errors="coerce")
+    df["GroupSize"] = group_id.map(group_sizes).fillna(1)
+
     df["TotalSpend"] = df[SPEND_COLS].fillna(0).sum(axis=1)
-    df["AnySpend"] = df["TotalSpend"].gt(0).astype(int)
+    df["AnySpend"] = (df["TotalSpend"] > 0).astype(int)
 
-    pid = df["PassengerId"].str.split("_")
-    group = pid.str[0]
-
-    df["InGroupIndex"] = pd.to_numeric(pid.str[1], errors="coerce")
-    df["GroupSize"] = group.map(group_sizes)
+    df["IsAlone"] = (df["GroupSize"] == 1).astype(int)
+    df["SpendPerGroupMember"] = df["TotalSpend"] / df["GroupSize"].replace(0, np.nan)
+    df["CryoSleepAnySpendMismatch"] = (
+        (df["CryoSleep"] == True) & (df["AnySpend"] == 1)  # noqa: E712
+    ).astype(int)
+    df["DeckSide"] = (
+        df["CabinDeck"].fillna("Unknown") + "_" + df["CabinSide"].fillna("Unknown")
+    )
+    df["CabinKnown"] = df["Cabin"].notna().astype(int)
+    df["AgeMissing"] = df["Age"].isna().astype(int)
+    df["VIPMissing"] = df["VIP"].isna().astype(int)
 
     return df
+
+
+def catboost_model(config):
+    return CatBoostClassifier(
+        depth=config["depth"],
+        learning_rate=config["learning_rate"],
+        iterations=config["iterations"],
+        l2_leaf_reg=config["l2_leaf_reg"],
+        loss_function="Logloss",
+        eval_metric="Accuracy",
+        auto_class_weights="Balanced",
+        random_seed=SEED,
+        verbose=False,
+    )
+
+
+def prepare_catboost_data(X, X_test):
+    cat_cols = X.select_dtypes(include=["object", "string", "bool"]).columns.tolist()
+    X_cb = X.copy()
+    X_test_cb = X_test.copy()
+
+    for col in cat_cols:
+        X_cb[col] = X_cb[col].fillna("Missing").astype(str)
+        X_test_cb[col] = X_test_cb[col].fillna("Missing").astype(str)
+
+    return X_cb, X_test_cb, cat_cols
+
+
+def evaluate_config(X, y, cat_cols, config):
+    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
+    scores = []
+    best_iterations = []
+    for train_idx, val_idx in cv.split(X, y):
+        fold_model = catboost_model(config)
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        fold_model.fit(
+            X_train,
+            y_train,
+            cat_features=cat_cols,
+            eval_set=(X_val, y_val),
+            use_best_model=True,
+            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        )
+        y_pred = fold_model.predict(X_val)
+        scores.append(accuracy_score(y_val, y_pred))
+        best_iterations.append(max(1, fold_model.get_best_iteration()))
+
+    score_array = np.array(scores)
+    return {
+        "config": config,
+        "cv_mean": float(score_array.mean()),
+        "cv_std": float(score_array.std()),
+        "best_iterations": int(np.median(best_iterations)),
+        "stability_score": float(score_array.mean() - 0.5 * score_array.std()),
+    }
+
+
+def tune_configs(X, y, cat_cols):
+    results = []
+    for i, config in enumerate(CATBOOST_CONFIGS, start=1):
+        result = evaluate_config(X, y, cat_cols, config)
+        results.append(result)
+        print(
+            f"[{i}/{len(CATBOOST_CONFIGS)}] "
+            f"depth={config['depth']} lr={config['learning_rate']} "
+            f"l2={config['l2_leaf_reg']} -> "
+            f"cv={result['cv_mean']:.4f} (+/- {result['cv_std']:.4f}), "
+            f"best_iters={result['best_iterations']}"
+        )
+
+    return sorted(results, key=lambda r: (r["stability_score"], r["cv_mean"]), reverse=True)
 
 
 def main():
@@ -40,8 +131,8 @@ def main():
     train = pd.read_csv(DATA_DIR / "train.csv")
     test = pd.read_csv(DATA_DIR / "test.csv")
 
-    all_groups = pd.concat([train["PassengerId"], test["PassengerId"]]).str.split("_").str[0]
-    group_sizes = all_groups.value_counts()
+    all_ids = pd.concat([train["PassengerId"], test["PassengerId"]])
+    group_sizes = all_ids.str.split("_").str[0].value_counts()
 
     train = add_features(train, group_sizes)
     test = add_features(test, group_sizes)
@@ -52,46 +143,26 @@ def main():
     X = train.drop(columns=drop_cols)
     X_test = test.drop(columns=drop_cols)
 
-    categorical = X.select_dtypes(include=["object", "string", "bool"]).columns.tolist()
-    numeric = X.columns.difference(categorical).tolist()
+    X_cb, X_test_cb, cat_cols = prepare_catboost_data(X, X_test)
+    ranked = tune_configs(X_cb, y, cat_cols)
+    best = ranked[0]
+    chosen_config = {**best["config"], "iterations": best["best_iterations"]}
+    model = catboost_model(chosen_config)
 
-    preprocessor = ColumnTransformer(
-        [
-            (
-                "cat",
-                make_pipeline(
-                    SimpleImputer(strategy="most_frequent"),
-                    OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-                ),
-                categorical,
-            ),
-            ("num", SimpleImputer(strategy="median"), numeric),
-        ]
+    print(
+        "Chosen config: "
+        f"depth={chosen_config['depth']} lr={chosen_config['learning_rate']} "
+        f"l2={chosen_config['l2_leaf_reg']} iterations={chosen_config['iterations']}"
     )
+    print(f"Chosen CV accuracy: {best['cv_mean']:.4f} (+/- {best['cv_std']:.4f})")
 
-    model = make_pipeline(
-        preprocessor,
-        HistGradientBoostingClassifier(
-            max_depth=8,
-            learning_rate=0.06,
-            max_iter=350,
-            min_samples_leaf=20,
-            random_state=42,
-        ),
-    )
+    model.fit(X_cb, y, cat_features=cat_cols)
+    preds = model.predict(X_test_cb)
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
-
-    model.fit(X_train, y_train)
-    print(f"Holdout accuracy: {accuracy_score(y_val, model.predict(X_val)):.4f}")
-
-    model.fit(X, y)
     submission = pd.DataFrame(
         {
             "PassengerId": test["PassengerId"],
-            "Transported": model.predict(X_test).astype(bool),
+            "Transported": preds.astype(bool),
         }
     )
 
