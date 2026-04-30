@@ -1,4 +1,6 @@
-A centralized collection of my work on Kaggle competitions https://www.kaggle.com/pranshurao ... covering problem understanding, modeling, and iterative experimentation across a range of datasets and domains.
+https://www.kaggle.com/pranshurao
+
+A centralized collection of my work on Kaggle competitions ... covering problem understanding, modeling, and iterative experimentation across a range of datasets and domains.
 
 Each folder is a different project / competition. All code involved is here :)
 
