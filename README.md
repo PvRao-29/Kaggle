@@ -1,0 +1,1 @@
+A collection of Kaggle Competitions I have participated in
