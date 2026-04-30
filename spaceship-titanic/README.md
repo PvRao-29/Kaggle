@@ -1,6 +1,6 @@
 # Spaceship Titanic
 
-LATEST RANKING (as far as I know) = 199
+**LATEST RANKING (as far as I know) = 199**
 
 This repository trains a tabular ML model for the [Spaceship Titanic](https://www.kaggle.com/competitions/spaceship-titanic) competition and generates a Kaggle-ready `submission.csv`.
 
