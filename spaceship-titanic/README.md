@@ -1,6 +1,6 @@
 # Spaceship Titanic
 
-**LATEST RANKING (as far as I know) = 199**
+**CURRENTLY ACHIEVING A SCORE IN THE TOP 200 OUT OF 140,000 ENTRANTS**
 
 This repository trains a tabular ML model for the [Spaceship Titanic](https://www.kaggle.com/competitions/spaceship-titanic) competition and generates a Kaggle-ready `submission.csv`.
 
