@@ -1,6 +1,9 @@
+import argparse
+import json
 from pathlib import Path
 
 import numpy as np
+import optuna
 import pandas as pd
 from catboost import CatBoostClassifier
 from sklearn.metrics import accuracy_score
@@ -10,12 +13,27 @@ ROOT = Path(__file__).parent
 DATA = ROOT / "data"
 OUT = ROOT / "outputs"
 
-SEED = 42
+SEED = 29
 SPEND = ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]
 CV_SEEDS = [13, 29, 42]
 FOLDS = 5
+EARLY_STOP = 200
+MAX_ITER = 3000
 
-CONFIG = dict(depth=6, learning_rate=0.05, l2_leaf_reg=3, iterations=3000)
+# Set >0 to run Optuna before final CV; override with: python model.py --trials 50
+OPTUNA_TRIALS = 0
+
+
+def make_config(depth=6, learning_rate=0.10985745201142037, l2_leaf_reg=6.1652988679205905):
+    return dict(
+        depth=depth,
+        learning_rate=learning_rate,
+        l2_leaf_reg=l2_leaf_reg,
+        iterations=MAX_ITER,
+    )
+
+
+CONFIG = make_config()
 
 
 def mode_or_nan(s):
@@ -135,7 +153,25 @@ def model(config, seed):
     )
 
 
-def cross_validate(X, y, cat_cols):
+def cv_score_config(X, y, cat_cols, config, seeds):
+    scores = []
+    for seed in seeds:
+        cv = StratifiedKFold(FOLDS, shuffle=True, random_state=seed)
+        for tr, va in cv.split(X, y):
+            m = model(config, seed)
+            m.fit(
+                X.iloc[tr],
+                y.iloc[tr],
+                cat_features=cat_cols,
+                eval_set=(X.iloc[va], y.iloc[va]),
+                use_best_model=True,
+                early_stopping_rounds=EARLY_STOP,
+            )
+            scores.append(accuracy_score(y.iloc[va], m.predict(X.iloc[va])))
+    return float(np.mean(scores))
+
+
+def cross_validate(X, y, cat_cols, config):
     scores, iters = [], []
 
     for seed in CV_SEEDS:
@@ -143,14 +179,14 @@ def cross_validate(X, y, cat_cols):
         cv = StratifiedKFold(FOLDS, shuffle=True, random_state=seed)
 
         for tr, va in cv.split(X, y):
-            m = model(CONFIG, seed)
+            m = model(config, seed)
             m.fit(
                 X.iloc[tr],
                 y.iloc[tr],
                 cat_features=cat_cols,
                 eval_set=(X.iloc[va], y.iloc[va]),
                 use_best_model=True,
-                early_stopping_rounds=200,
+                early_stopping_rounds=EARLY_STOP,
             )
 
             fold_scores.append(accuracy_score(y.iloc[va], m.predict(X.iloc[va])))
@@ -167,21 +203,74 @@ def cross_validate(X, y, cat_cols):
     return np.mean(scores), np.std(scores), int(np.median(iters))
 
 
-def main():
-    OUT.mkdir(exist_ok=True)
+def tune_hyperparams(X, y, cat_cols, n_trials, tune_seeds):
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    def objective(trial):
+        config = make_config(
+            depth=trial.suggest_int("depth", 4, 10),
+            learning_rate=trial.suggest_float("learning_rate", 0.02, 0.12, log=True),
+            l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 12.0, log=True),
+        )
+        return cv_score_config(X, y, cat_cols, config, tune_seeds)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_params
+    tuned = make_config(
+        depth=best["depth"],
+        learning_rate=best["learning_rate"],
+        l2_leaf_reg=best["l2_leaf_reg"],
+    )
+    return tuned, study.best_value, study
+
+
+def load_data():
     train = pd.read_csv(DATA / "train.csv")
     test = pd.read_csv(DATA / "test.csv")
-
     stats = build_stats(train, test)
     train = add_features(train, stats)
     test = add_features(test, stats)
+    return prepare(train, test), test
 
-    X, y, X_test, cat_cols = prepare(train, test)
 
-    mean, std, best_iters = cross_validate(X, y, cat_cols)
+def main(trials=OPTUNA_TRIALS, tune_seeds=None):
+    OUT.mkdir(exist_ok=True)
+    tune_seeds = tune_seeds or [SEED]
 
-    final_config = {**CONFIG, "iterations": best_iters}
+    (X, y, X_test, cat_cols), test = load_data()
+    config = make_config(**{k: CONFIG[k] for k in ("depth", "learning_rate", "l2_leaf_reg")})
+
+    if trials > 0:
+        print(f"Optuna: {trials} trials, {len(tune_seeds)} seed(s) x {FOLDS} folds per trial")
+        baseline = cv_score_config(X, y, cat_cols, config, tune_seeds)
+        print(f"Baseline CV ({config}): {baseline:.4f}")
+
+        config, tuned_cv, study = tune_hyperparams(X, y, cat_cols, trials, tune_seeds)
+        print(f"Optuna best CV: {tuned_cv:.4f}  params={config}")
+
+        out = {
+            "trials": trials,
+            "tune_seeds": tune_seeds,
+            "baseline_cv": baseline,
+            "best_cv": tuned_cv,
+            "best_params": {
+                "depth": config["depth"],
+                "learning_rate": config["learning_rate"],
+                "l2_leaf_reg": config["l2_leaf_reg"],
+            },
+        }
+        path_params = OUT / "optuna_best.json"
+        path_params.write_text(json.dumps(out, indent=2))
+        print(f"Wrote {path_params}")
+
+    mean, std, best_iters = cross_validate(X, y, cat_cols, config)
+
+    final_config = {**config, "iterations": best_iters}
     final_model = model(final_config, SEED)
     final_model.fit(X, y, cat_features=cat_cols)
 
@@ -212,4 +301,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Spaceship Titanic CatBoost pipeline")
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=OPTUNA_TRIALS,
+        help="Optuna trials (0 = skip tuning, use CONFIG defaults)",
+    )
+    parser.add_argument(
+        "--tune-seeds",
+        type=int,
+        nargs="+",
+        default=[SEED],
+        help="CV seeds during Optuna (default: 42 only, for speed)",
+    )
+    args = parser.parse_args()
+    main(trials=args.trials, tune_seeds=args.tune_seeds)
